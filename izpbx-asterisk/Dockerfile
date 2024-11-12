@@ -2,8 +2,6 @@ ARG RHEL_VER=8
 ARG IMAGE_FROM=rockylinux/rockylinux:${RHEL_VER}
 FROM ${IMAGE_FROM}
 
-MAINTAINER Ugo Viti <u.viti@wearequantico.it>
-
 ### default app args used during build step
 #ARG APP_VER_MAJOR=
 #ARG APP_VER_MINOR=
@@ -25,7 +23,7 @@ ARG TARGETOS
 
 ### components app versions
 ## https://downloads.asterisk.org/pub/telephony/asterisk/releases
-ARG ASTERISK_VER=20.9.2
+ARG ASTERISK_VER=20.10.0
 
 ## https://github.com/FreePBX/core/tags
 ## (only major version)
@@ -65,6 +63,9 @@ ARG ZABBIX_TEMPLATE_VER=main
 ## https://github.com/irontec/sngrep/releases
 ARG SNGREP_VER=1.8.2
 ARG SNGREP_XTRA_BUILDCONFIG=""
+
+LABEL version="${APP_VER}"
+LABEL description="FreePBX ${FREEPBX_VER} with Asterisk ${ASTERISK_VER}"
 
 ### define variables for later container usage
 ENV ASTERISK_VER=${ASTERISK_VER}
@@ -268,10 +269,14 @@ RUN set -xe && \
   \
   if [[ ${APP_DEBUG} -eq 0 ]]; then \
     : "---------- Clean temporary files ----------" && \
-    dnf clean all && rm -rf /var/cache/{dnf,yum} \
+    dnf clean all && \
+    rm -rf /var/cache/{dnf,yum}/* && \
+    rm -rf /var/tmp/* && \
+    rm -rf /tmp/* && \
+    mkdir -p /tmp && \
+    chmod 1777 /tmp \
   ;fi && \
   : "---------- ALL install finished ----------"
-
 ### STEP 2: PREPARE SYSTEM USERS
 ## prep users
 RUN set -xe && \
@@ -281,7 +286,17 @@ RUN set -xe && \
   usermod -aG wheel,apache ${APP_USR} && \
   ## fix phpMyAdmin apache group permissions
   chmod g+w /var/lib/phpMyAdmin/temp
-
+  RUN set -xe && \
+  mkdir -p /var/www/html/admin && \
+  mkdir -p /etc/asterisk && \
+  mkdir -p /var/lib/asterisk && \
+  mkdir -p /var/spool/asterisk && \
+  chown -R asterisk:asterisk /var/www/html && \
+  chmod -R 755 /var/www/html/admin && \
+  chown -R ${APP_USR}:${APP_GRP} \
+    /etc/asterisk \
+    /var/lib/asterisk \
+    /var/spool/asterisk
 ### STEP 3: BUILD STAGE
 ## build asterisk
 RUN set -xe && \
@@ -609,7 +624,7 @@ RUN set -xe && \
   make config && \
   make samples && \
   ldconfig && \
-  : "---------- END build ----------" && \
+  : "---------- END build ASTERISK main ----------" && \
   \
   : "---------- START build bcg729 ----------" && \
   cd /usr/src && \
@@ -639,7 +654,7 @@ RUN set -xe && \
   make install && \
   ldconfig \
   ;fi && \
-  : "---------- END build ----------" && \
+  : "---------- END build asterisk-g72x ----------" && \
   \
   : "---------- START build asterisk-chan-dongle ----------" && \
   cd /usr/src && \
@@ -651,7 +666,7 @@ RUN set -xe && \
   make && \
   make install && \
   ldconfig && \
-  : "---------- END build ----------" && \
+  : "---------- END build asterisk-chan-dongle ----------" && \
   \
   : "---------- START build sngrep ----------" && \
   cd /usr/src && \
@@ -663,17 +678,29 @@ RUN set -xe && \
   make && \
   make install && \
   ldconfig && \
-  : "---------- END build ----------" && \
-  \
+  : "---------- END build sngrep ----------" 
+
+  RUN set -xe && \
+    asterisk -V && \
+    test -f /usr/sbin/asterisk && \
+    echo "Asterisk compilation successful before delete temp files"
+    
+  RUN set -xe && \
   if [[ ${APP_DEBUG} -eq 0 ]]; then \
   : "---------- Clean temporary files ----------" && \
   dnf remove ${DNF_OPTS} ${ASTERISK_BUILD_DEPS} ${ASTERISK_BUILD_DEPS_EXTRA} && \
   dnf clean all && \
   rm -rf /var/cache/yum /tmp /usr/src && \
+  rm -rf /var/cache/{dnf,yum}/* && \
+  rm -rf /var/tmp/* && \
+  rm -rf /tmp/* && \
   mkdir -p /usr/src /tmp && chmod 1777 /tmp \
   ;fi && \
   : "---------- ALL builds finished ----------" 
-
+  RUN set -xe && \
+  asterisk -V && \
+  test -f /usr/sbin/asterisk && \
+  echo "Asterisk compilation successful after delete temp files"
 ### NOTE: asterisk build
 ## to get the options passed above: menuselect/menuselect --list-options
 
@@ -685,30 +712,45 @@ RUN set -xe && \
 ## copy external sources files again
 ADD build/ /usr/src/
 
+# Création des dossiers nécessaires et des utilisateurs
+RUN set -xe && \
+    # Création de l'utilisateur mysql
+    groupadd -r mysql && \
+    useradd -r -g mysql -s /sbin/nologin mysql && \
+    # Création des dossiers
+    mkdir -p /var/www/html/admin && \
+    mkdir -p /etc/asterisk && \
+    mkdir -p /var/lib/asterisk && \
+    mkdir -p /var/spool/asterisk && \
+    # Attribution des permissions
+    chown -R asterisk:asterisk /var/www/html
+
 ## deploy freepbx
 RUN set -xe && \
-  \
   cd /usr/src && \
+  echo "Début de l'installation des modules de FreePBX..." && \
+  rm -rf freepbx && \
   mkdir freepbx && \
-  # deprecated download (because this is not the latest version)
-  #curl -fSL --connect-timeout 30 http://mirror.freepbx.org/modules/packages/freepbx/freepbx-${FREEPBX_VER}.0-latest.tgz | tar xz --strip 1 -C freepbx && \
   cd freepbx && \
-  ## download modules-*.xml file if not exist in local build dir
-  if [[ -e "/usr/src/modules-${FREEPBX_VER}.0.xml" ]]; then cp "/usr/src/modules-${FREEPBX_VER}.0.xml" "/usr/src/freepbx/modules-${FREEPBX_VER}.0.xml"; else \
-    curl -fSL --connect-timeout 30 http://mirror1.freepbx.org/modules-${FREEPBX_VER}.0.xml -o modules-${FREEPBX_VER}.0.xml \
-  ;fi && \
-  \
-  # download latest framework release
-  MODULE="framework" && \
-  MODULE_VER=$(php -r "echo json_encode(simplexml_load_file('modules-${FREEPBX_VER}.0.xml'));" | jq -r ".module[] | select(.rawname == \"${MODULE}\") | {version}".version) && \
-  echo "---------- Predownloading freepbx framework latest release: ${MODULE_VER} ----------" && \
-  curl -sfSL --connect-timeout 30 http://mirror.freepbx.org/modules/packages/$MODULE/$MODULE-${MODULE_VER}.tgz | tar xz --strip 1 -C ./ && \
-  \
-  # make the modules cache
+  # Vérification des fichiers
+  ls -la /usr/src/configedit-release-16.0.tar && \
+  echo "Fichier configedit-release-16.0.tar present" && \
+  # Extraction du module configedit
+  tar xf /usr/src/configedit-release-16.0.tar -C /usr/src/ && \
+  # Création du dossier cache
   mkdir -p amp_conf/htdocs/admin/modules/_cache && \
-  # predownload the following modules for faster install (need to skip 'framework' module)
+  # Téléchargement du fichier modules.xml
+  if [[ -e "/usr/src/modules-${FREEPBX_VER}.0.xml" ]]; then \
+    cp "/usr/src/modules-${FREEPBX_VER}.0.xml" "/usr/src/freepbx/modules-${FREEPBX_VER}.0.xml"; \
+  else \
+    curl -fSL --connect-timeout 30 http://mirror1.freepbx.org/modules-${FREEPBX_VER}.0.xml -o modules-${FREEPBX_VER}.0.xml; \
+  fi
+  # Configuration des modules
+  RUN set -xe && \
+  cd /usr/src/freepbx && \
   for MODULE in \
       core \
+      configedit \
       featurecodeadmin \
       customappsreg \
       recordings \
@@ -753,16 +795,173 @@ RUN set -xe && \
       music \
       infoservices \
       weakpasswords \
-      pm2 \
-      ; do \
-  # download loop
-  MODULE_VER=$(php -r "echo json_encode(simplexml_load_file('modules-${FREEPBX_VER}.0.xml'));" | jq -r ".module[] | select(.rawname == \"${MODULE}\") | {version}".version) && \
-  mkdir -p amp_conf/htdocs/admin/modules/$MODULE && \
-  echo "---------- Predownloading module for offline install: $MODULE ${MODULE_VER} ----------" && \
-  curl -sfSL --connect-timeout 30 http://mirror.freepbx.org/modules/packages/$MODULE/$MODULE-${MODULE_VER}.tgz | tar xz --strip 1 -C amp_conf/htdocs/admin/modules/$MODULE/ && \
-  curl -sfSL --connect-timeout 30 http://mirror.freepbx.org/modules/packages/$MODULE/$MODULE-${MODULE_VER}.tgz.gpg -o amp_conf/htdocs/admin/modules/_cache/$MODULE-${MODULE_VER}.tgz.gpg \
-  ; done
-  
+      pm2; do \
+    MODULE_VER=$(php -r "echo json_encode(simplexml_load_file('modules-${FREEPBX_VER}.0.xml'));" | jq -r ".module[] | select(.rawname == \"${MODULE}\") | {version}".version) && \
+    mkdir -p amp_conf/htdocs/admin/modules/$MODULE && \
+    echo "---------- Downloading module: $MODULE ${MODULE_VER} ----------" && \
+    curl -sfSL --connect-timeout 30 --retry 3 --retry-delay 2 http://mirror.freepbx.org/modules/packages/$MODULE/$MODULE-${MODULE_VER}.tgz -o /tmp/$MODULE.tgz && \
+    tar xzf /tmp/$MODULE.tgz --strip 1 -C amp_conf/htdocs/admin/modules/$MODULE/ && \
+    curl -sfSL --connect-timeout 30 --retry 3 --retry-delay 2 http://mirror.freepbx.org/modules/packages/$MODULE/$MODULE-${MODULE_VER}.tgz.gpg -o amp_conf/htdocs/admin/modules/_cache/$MODULE-${MODULE_VER}.tgz.gpg && \
+    rm -f /tmp/$MODULE.tgz; \
+  done
+# Installation temporaire de MariaDB pour l'installation de FreePBX
+# Démarrage et vérification de MariaDB
+# 1. Installation de MariaDB
+RUN dnf install -y mariadb-server
+
+# 2. Copie de la configuration
+COPY build/my.cnf /etc/my.cnf
+
+# 3. Initialisation et configuration de la base
+# 3. Initialisation et configuration de la base
+RUN set -xe && \
+    echo "Début de l'installation de mysql_install_db..." && \
+    # Initialisation de la base de données
+    mysql_install_db --user=mysql --datadir=/var/lib/mysql && \
+    # Démarrage temporaire avec mysqld
+    /usr/libexec/mysqld --user=mysql --datadir=/var/lib/mysql --skip-networking --socket=/var/lib/mysql/mysql.sock & \
+    pid="$!" && \
+    # Attente que MariaDB soit prêt
+    for i in {30..0}; do \
+        if echo 'SELECT 1' | mysql --socket=/var/lib/mysql/mysql.sock &> /dev/null; then \
+            break; \
+        fi; \
+        echo 'Waiting for MariaDB to be ready...' && sleep 1; \
+    done && \
+    # Création des bases et utilisateurs via un fichier SQL
+    echo "CREATE DATABASE IF NOT EXISTS asterisk; \
+          CREATE DATABASE IF NOT EXISTS asteriskcdrdb; \
+          GRANT ALL PRIVILEGES ON asterisk.* TO 'asterisk'@'localhost' IDENTIFIED BY 'initial-password'; \
+          GRANT ALL PRIVILEGES ON asteriskcdrdb.* TO 'asterisk'@'localhost' IDENTIFIED BY 'initial-password'; \
+          GRANT ALL PRIVILEGES ON asterisk.* TO 'asterisk'@'%' IDENTIFIED BY 'initial-password'; \
+          GRANT ALL PRIVILEGES ON asteriskcdrdb.* TO 'asterisk'@'%' IDENTIFIED BY 'initial-password'; \
+          FLUSH PRIVILEGES;" > /tmp/mysql_init.sql && \
+    # Exécution des commandes SQL
+    cat /tmp/mysql_init.sql | mysql --socket=/var/lib/mysql/mysql.sock && \
+    # Arrêt propre
+    kill $pid && \
+    for i in {30..0}; do \
+        if ! kill -0 $pid 2>/dev/null; then \
+            break; \
+        fi; \
+        sleep 1; \
+    done && \
+    # Nettoyage
+    rm -f /tmp/mysql_init.sql && \
+    dnf clean all && \
+    rm -rf /var/cache/dnf/*
+
+# Téléchargement et extraction de FreePBX
+RUN set -xe && \
+    mkdir -p /usr/src/freepbx && \
+    cd /usr/src && \
+    curl -fSL --connect-timeout 30 http://mirror.freepbx.org/modules/packages/freepbx/freepbx-16.0-latest.tgz | tar xz -C freepbx --strip-components=1
+
+# Installation de FreePBX
+# Configurer MySQL et Asterisk
+RUN set -xe && \
+    # Démarrer MySQL
+    /usr/libexec/mysqld --user=mysql --datadir=/var/lib/mysql --socket=/var/lib/mysql/mysql.sock --pid-file=/var/run/mariadb/mariadb.pid --port=3306 & \
+    # Attendre que MySQL soit prêt
+    for i in {30..0}; do \
+        if mysqladmin ping -h localhost --silent; then \
+            break; \
+        fi; \
+        echo "Waiting for MySQL to be ready..." && sleep 1; \
+    done && \
+    # Créer la base de données et l'utilisateur pour FreePBX
+    mysql -u root -e "CREATE DATABASE IF NOT EXISTS asterisk;" && \
+    mysql -u root -e "CREATE DATABASE IF NOT EXISTS asteriskcdrdb;" && \
+    mysql -u root -e "GRANT ALL PRIVILEGES ON asterisk.* TO asterisk@localhost IDENTIFIED BY 'initial-password';" && \
+    mysql -u root -e "GRANT ALL PRIVILEGES ON asteriskcdrdb.* TO asterisk@localhost IDENTIFIED BY 'initial-password';" && \
+    mysql -u root -e "FLUSH PRIVILEGES;" && \
+    # Configurer Asterisk
+    usermod -s /bin/bash asterisk && \
+    mkdir -p /home/asterisk && \
+    chown -R asterisk:asterisk /home/asterisk && \
+    chown -R asterisk:asterisk /etc/asterisk && \
+    chown -R asterisk:asterisk /var/{lib,log,run,spool}/asterisk && \
+    # Démarrer Asterisk
+    su asterisk -c "asterisk -F" & \
+    # Attendre qu'Asterisk soit prêt
+    for i in {30..0}; do \
+        if su asterisk -c "asterisk -rx 'core show version'" &>/dev/null; then \
+            break; \
+        fi; \
+        echo "Waiting for Asterisk to be ready..." && sleep 1; \
+    done && \
+    # Installation de FreePBX
+    cd /usr/src/freepbx && \
+    chmod +x install && \
+    ./install -n \
+        --webroot=/var/www/html \
+        --astetcdir=/etc/asterisk \
+        --astmoddir=/usr/lib64/asterisk/modules \
+        --astvarlibdir=/var/lib/asterisk \
+        --astagidir=/var/lib/asterisk/agi-bin \
+        --astspooldir=/var/spool/asterisk \
+        --astrundir=/var/run/asterisk \
+        --astlogdir=/var/log/asterisk \
+        --ampbin=/var/lib/asterisk/bin \
+        --ampsbin=/usr/sbin \
+        --ampcgibin=/var/www/cgi-bin \
+        --ampplayback=/var/lib/asterisk/playback \
+        --dbhost=localhost \
+        --dbname=asterisk \
+        --dbuser=asterisk \
+        --dbpass=initial-password \
+        --cdrdbname=asteriskcdrdb
+
+# Installation des modules et vérifications
+RUN set -xe && \
+    # Démarrage de MySQL
+    /usr/libexec/mysqld --user=mysql --datadir=/var/lib/mysql --socket=/var/lib/mysql/mysql.sock --pid-file=/var/run/mariadb/mariadb.pid --port=3306 & \
+    # Attente que MySQL soit prêt avec un nombre limité de tentatives
+    for i in {30..0}; do \
+        if mysqladmin ping -h localhost -u root --silent; then \
+            break; \
+        fi; \
+        echo "Waiting for MySQL to be ready..." && sleep 1; \
+    done && \
+    # Vérification simple de la connexion
+    mysql -u root -e "SELECT 1;" && \
+    # Installation des modules FreePBX
+    cd /var/www/html/admin && \
+    fwconsole ma install framework core configedit && \
+    fwconsole chown && \
+    fwconsole reload
+# Vérification de l'installation d'Asterisk et FreePBX
+RUN set -xe && \
+    # Vérifier la version d'Asterisk
+    asterisk -V && \
+    # Vérifier la version de FreePBX
+    fwconsole -V && \
+    # Vérifier qu'Asterisk est en cours d'exécution et répond
+    asterisk -rx "core show version" && \
+    # Vérifier que le module de numérotation est chargé
+    asterisk -rx "module show" | grep -q "Module 'app_dial.so' loaded" && \
+    # Vérifier l'installation des modules FreePBX essentiels
+    [ -d "/var/www/html/admin/modules/configedit" ] || exit 1 && \
+    [ -d "/var/www/html/admin/modules/core" ] || exit 1 && \
+    [ -d "/var/www/html/admin/modules/framework" ] || exit 1 && \
+    # Vérifier la présence des fichiers de configuration SIP
+    [ -f "/etc/asterisk/sip.conf" ] || exit 1 && \
+    [ -f "/etc/asterisk/pjsip.conf" ] || exit 1 && \
+    # Afficher un message de succès
+    echo "Vérification de l'installation d'Asterisk et FreePBX réussie"
+
+# Vérification des permissions
+RUN set -xe && \
+    chmod 600 /etc/asterisk/*.conf && \
+    chmod 755 /var/www/html/admin/modules/* && \
+    chown -R asterisk:asterisk /var/www/html/admin/modules && \
+    # Vérification de la base de données
+    mysql -u asterisk -pinitial-password asterisk -e "SELECT 1" && \
+    # Arrêt propre de MariaDB
+    mysqladmin -u root shutdown && \
+    # Nettoyage
+    rm -rf /var/lib/mysql/* && \
+    echo "FreePBX installation completed successfully"
 ## install other components
 RUN set -xe && \
   . /etc/os-release && export OSARCH=$(uname -m) && \
@@ -864,6 +1063,21 @@ ENV APP_BUILD_DATE="${APP_BUILD_DATE}"
 
 ## add files to container
 ADD rootfs Dockerfile README.md /
+
+# Ajouter HEALTHCHECK
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD asterisk -rx "core show version" >/dev/null && \
+        curl -f http://localhost/admin/config.php || exit 1
+
+# Optimisation finale
+RUN set -xe && \
+    dnf clean all && \
+    rm -rf /var/cache/{dnf,yum}/* && \
+    rm -rf /var/tmp/* && \
+    rm -rf /tmp/* && \
+    rm -rf /usr/src/* && \
+    mkdir -p /tmp && \
+    chmod 1777 /tmp
 
 ## start the container process
 ENTRYPOINT ["/entrypoint.sh"]
